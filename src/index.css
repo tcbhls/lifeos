@@ -1,0 +1,97 @@
+@import "tailwindcss";
+
+/* 允许通过 html.dark 类精准控制暗色主题，同时兼容跟随系统 */
+@custom-variant dark (&:where(.dark, .dark *));
+
+@layer base {
+  :root {
+    color-scheme: light;
+    --safe-top: env(safe-area-inset-top, 0px);
+    --safe-bottom: env(safe-area-inset-bottom, 0px);
+  }
+
+  .dark {
+    color-scheme: dark;
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+    margin: 0;
+    padding: 0;
+    overscroll-behavior-y: contain;
+    -webkit-tap-highlight-color: transparent;
+    font-family:
+      "Inter",
+      -apple-system,
+      BlinkMacSystemFont,
+      "PingFang SC",
+      "Hiragino Sans GB",
+      "Microsoft YaHei",
+      sans-serif;
+  }
+
+  body {
+    @apply bg-zinc-100 text-zinc-900 antialiased dark:bg-[#050608] dark:text-zinc-100;
+  }
+
+  button {
+    user-select: none;
+    -webkit-user-select: none;
+  }
+}
+
+/* 等宽数字，保证 KPI 数值与倒计时不抖动 */
+.num-tabular {
+  font-variant-numeric: tabular-nums;
+}
+
+/* 隐藏移动端横向滚动条，保持原生 App 触感 */
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+/* 页面切入柔和微动效 */
+@keyframes pageFadeIn {
+  0% {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-page-in {
+  animation: pageFadeIn 220ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+/* 经验值获得浮动提示动效 */
+@keyframes xpFloatUp {
+  0% {
+    opacity: 0;
+    transform: translateY(8px) scale(0.94);
+  }
+  18% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+  82% {
+    opacity: 1;
+    transform: translateY(-2px) scale(1);
+  }
+  100% {
+    opacity: 0;
+    transform: translateY(-10px) scale(0.96);
+  }
+}
+
+.animate-xp-toast {
+  animation: xpFloatUp 2.2s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+}
