@@ -3,6 +3,7 @@ import { Capacitor, registerPlugin, type PluginListenerHandle } from '@capacitor
 export interface DownloadedModelFile {
   fileName: string;
   sizeBytes: number;
+  shared?: boolean;
 }
 
 export interface LocalLlmStatus {
@@ -10,6 +11,8 @@ export interface LocalLlmStatus {
   loaded: boolean;
   loadedFileName: string;
   downloading: boolean;
+  sharedStorageGranted?: boolean;
+  sharedDirPath?: string;
   systemInfo: string;
   modelsDir: string;
   downloadedFiles: DownloadedModelFile[];
@@ -34,6 +37,7 @@ export interface LocalCompleteResult {
 
 interface LifeOsLocalLlmNativePlugin {
   getStatus(): Promise<LocalLlmStatus>;
+  requestSharedStoragePermission(): Promise<{ granted: boolean; openedSettings: boolean }>;
   downloadModel(options: {
     url: string;
     fallbackUrl?: string;
@@ -45,7 +49,7 @@ interface LifeOsLocalLlmNativePlugin {
     fileName: string;
     contextSize?: number;
     threads?: number;
-  }): Promise<{ loaded: boolean; fileName: string; loadTimeMs?: number; cached?: boolean }>;
+  }): Promise<{ loaded: boolean; fileName: string; loadTimeMs?: number; cached?: boolean; shared?: boolean }>;
   unloadModel(): Promise<{ unloaded: boolean }>;
   complete(options: {
     prompt: string;
@@ -82,15 +86,53 @@ export interface EmbeddedModelSpec {
   desc: string;
   /** 魔搭社区国内免梯子高速直链 */
   primaryUrl: string;
-  /** HF-Mirror 国内镜像兜底直链 */
+  /** 备用高速直链 */
   fallbackUrl: string;
 }
 
 /**
- * 经过实测验证（返回真 GGUF 魔数头 + 国内免梯子直连）的 3 款手机端侧模型
- * 均配合 LifeOS 本地健身/养生 RAG 知识库运行，零外部服务器、零 API Key
+ * 三端生态统一端侧离线模型清单（与音枢 AI 音乐、EchoDeck 共用手机 Download/LocalAI 零拷贝目录）
+ * 均经实测返回标准 GGUF 魔数头，支持 5GB 级断点续传
  */
 export const EMBEDDED_LOCAL_MODELS: EmbeddedModelSpec[] = [
+  {
+    id: 'qwen3-8b',
+    name: 'Qwen3-8B（Q4_K_M · 旗舰满血）',
+    badge: '4.80 GB · 三端共享首选',
+    fileName: 'Qwen3-8B-Q4_K_M.gguf',
+    sizeLabel: '4.80 GB',
+    ramHint: '推荐 12GB / 16GB 旗舰机',
+    desc: '端侧智商天花板，复杂健身周期编排、营养配比与食疗养生推理最细腻；与音枢、EchoDeck 零拷贝共享同一份文件。',
+    primaryUrl:
+      'https://www.modelscope.cn/api/v1/models/Qwen/Qwen3-8B-GGUF/repo?Revision=master&FilePath=Qwen3-8B-Q4_K_M.gguf',
+    fallbackUrl:
+      'https://www.modelscope.cn/api/v1/models/unsloth/Qwen3-8B-GGUF/repo?Revision=master&FilePath=Qwen3-8B-Q4_K_M.gguf',
+  },
+  {
+    id: 'qwen3-4b',
+    name: 'Qwen3-4B（Q4_K_M · 全能甜点）',
+    badge: '2.38 GB · 速度智商双优',
+    fileName: 'Qwen3-4B-Q4_K_M.gguf',
+    sizeLabel: '2.38 GB',
+    ramHint: '建议 8GB+ 运存手机',
+    desc: '体积减半、响应极快发热低，中文饮食点评与动作纠错兼顾高智商与丝滑流畅。',
+    primaryUrl:
+      'https://www.modelscope.cn/api/v1/models/Qwen/Qwen3-4B-GGUF/repo?Revision=master&FilePath=Qwen3-4B-Q4_K_M.gguf',
+    fallbackUrl:
+      'https://www.modelscope.cn/api/v1/models/unsloth/Qwen3-4B-GGUF/repo?Revision=master&FilePath=Qwen3-4B-Q4_K_M.gguf',
+  },
+  {
+    id: 'qwen3-1.7b',
+    name: 'Qwen3-1.7B（轻快省电版）',
+    badge: '1.06 GB · 均衡流畅',
+    fileName: 'Qwen3-1.7B-Q4_K_M.gguf',
+    sizeLabel: '1.06 GB',
+    ramHint: '6GB+ 运存流畅运行',
+    desc: '仅 1GB 出头、低功耗秒级响应，配合内置健身养生知识库日常离线使用极稳。',
+    primaryUrl:
+      'https://www.modelscope.cn/api/v1/models/unsloth/Qwen3-1.7B-GGUF/repo?Revision=master&FilePath=Qwen3-1.7B-Q4_K_M.gguf',
+    fallbackUrl: 'https://hf-mirror.com/unsloth/Qwen3-1.7B-GGUF/resolve/main/Qwen3-1.7B-Q4_K_M.gguf',
+  },
   {
     id: 'qwen3-0.6b',
     name: 'Qwen3-0.6B（极速轻量版）',
@@ -98,35 +140,10 @@ export const EMBEDDED_LOCAL_MODELS: EmbeddedModelSpec[] = [
     fileName: 'Qwen3-0.6B-Q4_K_M.gguf',
     sizeLabel: '378 MB',
     ramHint: '4GB+ 运存即可流畅运行',
-    desc: '体积最小、普通 Wi-Fi 约 15 秒下完，配合内置养生健身知识库离线秒回，适合所有安卓机型。',
+    desc: '体积最小、普通 Wi-Fi 十余秒下完，适合存储空间紧张时离线兜底。',
     primaryUrl:
       'https://www.modelscope.cn/api/v1/models/unsloth/Qwen3-0.6B-GGUF/repo?Revision=master&FilePath=Qwen3-0.6B-Q4_K_M.gguf',
     fallbackUrl: 'https://hf-mirror.com/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q4_K_M.gguf',
-  },
-  {
-    id: 'qwen25-1.5b',
-    name: 'Qwen2.5-1.5B-Instruct（均衡推荐）',
-    badge: '1.04 GB · 中文最稳',
-    fileName: 'qwen2.5-1.5b-instruct-q4_k_m.gguf',
-    sizeLabel: '1.04 GB',
-    ramHint: '建议 8GB+ 运存手机',
-    desc: '中文理解与健身营养建议质量显著更强，指令遵循稳健，是手机自带离线 AI 的主力首选。',
-    primaryUrl:
-      'https://www.modelscope.cn/api/v1/models/Qwen/Qwen2.5-1.5B-Instruct-GGUF/repo?Revision=master&FilePath=qwen2.5-1.5b-instruct-q4_k_m.gguf',
-    fallbackUrl:
-      'https://hf-mirror.com/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/qwen2.5-1.5b-instruct-q4_k_m.gguf',
-  },
-  {
-    id: 'qwen3-1.7b',
-    name: 'Qwen3-1.7B（高阶推理版）',
-    badge: '1.03 GB · 新一代架构',
-    fileName: 'Qwen3-1.7B-Q4_K_M.gguf',
-    sizeLabel: '1.03 GB',
-    ramHint: '建议 8GB+ 运存手机',
-    desc: '最新 Qwen3 架构 1.7B 量化版，综合推理与食疗/训练规划更细腻。',
-    primaryUrl:
-      'https://www.modelscope.cn/api/v1/models/unsloth/Qwen3-1.7B-GGUF/repo?Revision=master&FilePath=Qwen3-1.7B-Q4_K_M.gguf',
-    fallbackUrl: 'https://hf-mirror.com/unsloth/Qwen3-1.7B-GGUF/resolve/main/Qwen3-1.7B-Q4_K_M.gguf',
   },
 ];
 
@@ -149,12 +166,21 @@ export async function getLocalLlmStatus(): Promise<LocalLlmStatus> {
       loaded: false,
       loadedFileName: '',
       downloading: false,
-      systemInfo: '当前为网页预览模式；安装 Android APK 后将自动启用手机内置原生 ARM64 llama.cpp 引擎',
+      sharedStorageGranted: false,
+      sharedDirPath: '/storage/emulated/0/Download/LocalAI',
+      systemInfo: '当前为网页预览模式；安装 Android APK 后将自动启用原生 ARM64 llama.cpp 与三端共享模型库',
       modelsDir: '',
       downloadedFiles: [],
     };
   }
   return NativeLocalLlm.getStatus();
+}
+
+export async function requestSharedStoragePermission(): Promise<{ granted: boolean; openedSettings: boolean }> {
+  if (!isEmbeddedLocalLlmSupported()) {
+    return { granted: false, openedSettings: false };
+  }
+  return NativeLocalLlm.requestSharedStoragePermission();
 }
 
 export async function downloadEmbeddedModel(
@@ -208,7 +234,7 @@ export async function unloadEmbeddedModel(): Promise<void> {
 }
 
 /**
- * 调用手机内置 ARM64 llama.cpp 引擎执行离线推理（若尚未载入内存会自动加载已下载的 GGUF）
+ * 调用手机内置 ARM64 llama.cpp 引擎执行离线推理（支持自动识别 Download/LocalAI 三端共享模型）
  */
 export async function runEmbeddedLocalCompletion(params: {
   modelFileName: string;
@@ -221,35 +247,53 @@ export async function runEmbeddedLocalCompletion(params: {
     throw new Error('App 内置离线 AI 需在 Android 手机 APK 中运行；电脑浏览器预览请先在设置页选用「智谱 GLM-4-Flash」');
   }
 
-  const spec = findEmbeddedModelSpec(params.modelFileName);
   const status = await NativeLocalLlm.getStatus();
-  const hasFile = status.downloadedFiles.some((f) => f.fileName === spec.fileName);
-  if (!hasFile) {
-    throw new Error(`尚未下载端侧模型「${spec.name}」：请打开右上角「设置」→「App 自带端侧 AI」点一下免费下载（国内魔搭直连 ${spec.sizeLabel}）`);
+  const matchedSpec = EMBEDDED_LOCAL_MODELS.find(
+    (m) => m.fileName === params.modelFileName || m.id === params.modelFileName,
+  );
+  let targetFile = matchedSpec ? matchedSpec.fileName : params.modelFileName;
+
+  if (!status.downloadedFiles.some((f) => f.fileName === targetFile)) {
+    if (status.downloadedFiles.length > 0) {
+      // 自动优先命中三端共享目录里体积最大（能力最强）的模型（如 Qwen3-8B）
+      const sorted = [...status.downloadedFiles].sort((a, b) => b.sizeBytes - a.sizeBytes);
+      targetFile = sorted[0].fileName;
+    } else {
+      const spec = matchedSpec ?? EMBEDDED_LOCAL_MODELS[0];
+      throw new Error(
+        `尚未下载端侧模型「${spec.name}」：请打开右上角「设置」→「App 自带端侧 AI」开启共享目录权限或免费下载（${spec.sizeLabel}）`,
+      );
+    }
   }
 
   const start = performance.now();
-  if (!status.loaded || status.loadedFileName !== spec.fileName) {
-    await NativeLocalLlm.loadModel({ fileName: spec.fileName, contextSize: 2048 });
+  if (!status.loaded || status.loadedFileName !== targetFile) {
+    await NativeLocalLlm.loadModel({ fileName: targetFile, contextSize: 2048 });
   }
 
   // Qwen3 关闭冗长思考标签，确保端侧生成干脆迅速
-  const finalPrompt = spec.id.startsWith('qwen3')
-    ? `${params.userPrompt}\n/no_think`
-    : params.userPrompt;
+  const isQwen3 = targetFile.toLowerCase().includes('qwen3');
+  const finalPrompt =
+    isQwen3 && !params.userPrompt.includes('/no_think')
+      ? `${params.userPrompt}\n/no_think`
+      : params.userPrompt;
 
   const res = await NativeLocalLlm.complete({
     prompt: finalPrompt,
     systemPrompt: params.systemPrompt || '',
-    maxTokens: Math.min(420, params.maxTokens ?? 360),
+    maxTokens: Math.min(520, params.maxTokens ?? 400),
     temperature: params.temperature ?? 0.45,
   });
 
-  const cleanText = res.text.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+  const cleanText = res.text
+    .replace(/<think>[\s\S]*?<\/think>/gi, '')
+    .replace(/^<think>[\s\S]*/i, '')
+    .trim();
   const speedTag = res.tokensPerSecond > 0 ? ` · ${res.tokensPerSecond.toFixed(1)}t/s` : '';
+  const displayName = matchedSpec ? matchedSpec.id : targetFile.replace(/\.gguf$/i, '');
   return {
     text: cleanText || res.text,
     latencyMs: Math.round(performance.now() - start),
-    usedModel: `本机端侧 ${spec.id}${speedTag}`,
+    usedModel: `本机端侧 ${displayName}${speedTag}`,
   };
 }

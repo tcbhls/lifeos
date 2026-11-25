@@ -87,7 +87,7 @@ public class MainActivity extends BridgeActivity {
         ImageView overlay = new ImageView(this);
         overlay.setImageResource(R.drawable.splash);
         overlay.setScaleType(ImageView.ScaleType.CENTER_CROP);
-        overlay.setBackgroundColor(Color.parseColor("#165E52"));
+        overlay.setBackgroundColor(Color.parseColor("#F7F6EE"));
         overlay.setClickable(true);
         overlay.setFocusable(true);
         overlay.setLayoutParams(new FrameLayout.LayoutParams(

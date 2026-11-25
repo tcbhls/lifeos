@@ -3,6 +3,7 @@ import {
   Check,
   Cpu,
   Download,
+  FolderOpen,
   HardDrive,
   Loader2,
   Play,
@@ -18,6 +19,7 @@ import {
   getLocalLlmStatus,
   isEmbeddedLocalLlmSupported,
   loadEmbeddedModel,
+  requestSharedStoragePermission,
   runEmbeddedLocalCompletion,
   unloadEmbeddedModel,
   type EmbeddedModelSpec,
@@ -35,8 +37,9 @@ interface EmbeddedLocalAiCardProps {
 }
 
 /**
- * LifeOS 内置端侧 AI 模型管理卡（基于 Android 原生预编译 llama.cpp JNI）：
- * 无需外部电脑、无需 Termux、无需 API Key，从国内魔搭社区一键下载量化 GGUF 到手机本地即开即用
+ * LifeOS 内置端侧 AI 模型管理卡（原生 ARM64 llama.cpp + 三端共享 Download/LocalAI）：
+ * - 与音枢 AI 音乐、EchoDeck 共用手机公共目录 Download/LocalAI 里的同一份 GGUF 权重
+ * - 支持 Qwen3-8B / Qwen3-4B 5GB 级断点续传与 GGUF 魔数头校验
  */
 export function EmbeddedLocalAiCard({
   settings,
@@ -64,23 +67,39 @@ export function EmbeddedLocalAiCard({
   }, []);
 
   useEffect(() => {
-    let cancelled = false;
-    getLocalLlmStatus()
-      .then((s) => {
-        if (!cancelled) setStatus(s);
-      })
-      .catch(() => {
-        // 忽略首次读取异常
-      });
-    return () => {
-      cancelled = true;
+    void refreshStatus();
+    const onResume = () => {
+      if (document.visibilityState === 'visible') {
+        void refreshStatus();
+      }
     };
-  }, []);
+    window.addEventListener('focus', onResume);
+    document.addEventListener('visibilitychange', onResume);
+    return () => {
+      window.removeEventListener('focus', onResume);
+      document.removeEventListener('visibilitychange', onResume);
+    };
+  }, [refreshStatus]);
 
-  const isDownloaded = (fileName: string) =>
-    Boolean(status?.downloadedFiles.some((f) => f.fileName === fileName));
+  const findDownloaded = (fileName: string) =>
+    status?.downloadedFiles.find((f) => f.fileName === fileName);
 
   const formatBytesMB = (bytes: number) => `${(bytes / 1024 / 1024).toFixed(0)} MB`;
+
+  const handleRequestSharedPerm = async () => {
+    void hapticLight();
+    try {
+      const res = await requestSharedStoragePermission();
+      if (res.granted) {
+        await refreshStatus();
+        onNotify('三端共享目录（Download/LocalAI）已就绪');
+      } else {
+        onNotify('请在系统页打开「允许管理所有文件」，返回即自动同步三端模型');
+      }
+    } catch (err: unknown) {
+      onNotify(err instanceof Error ? err.message : String(err));
+    }
+  };
 
   const handleDownload = async (spec: EmbeddedModelSpec) => {
     if (downloadingId) return;
@@ -117,7 +136,7 @@ export function EmbeddedLocalAiCard({
     await cancelEmbeddedModelDownload();
     setDownloadingId(null);
     setProgress(null);
-    onNotify('已取消模型下载');
+    onNotify('已暂停下载（保留断点进度，再次点击可续传）');
   };
 
   const handleActivate = async (spec: EmbeddedModelSpec) => {
@@ -128,7 +147,7 @@ export function EmbeddedLocalAiCard({
       await onActivateEmbeddedModel(spec);
       await refreshStatus();
       void hapticSuccess();
-      onNotify(`已切换至 App 内置 AI：${spec.name}`);
+      onNotify(`已切换至本机端侧 AI：${spec.name}`);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       setTestOutput({ ok: false, text: msg });
@@ -178,6 +197,9 @@ export function EmbeddedLocalAiCard({
   };
 
   const hasAnyDownloaded = (status?.downloadedFiles.length ?? 0) > 0;
+  const sharedGranted = Boolean(status?.sharedStorageGranted);
+  const catalogFileSet = new Set(EMBEDDED_LOCAL_MODELS.map((m) => m.fileName));
+  const extraFiles = (status?.downloadedFiles ?? []).filter((f) => !catalogFileSet.has(f.fileName));
 
   return (
     <section className="rounded-2xl bg-white dark:bg-zinc-900/95 border border-emerald-500/35 p-4 space-y-3.5">
@@ -189,7 +211,7 @@ export function EmbeddedLocalAiCard({
           <div className="min-w-0">
             <div className="flex items-center gap-1.5 flex-wrap">
               <h2 className="text-sm font-bold text-zinc-900 dark:text-zinc-100">
-                App 自带内置 AI（端侧离线引擎）
+                App 自带内置 AI（三端共享模型库）
               </h2>
               <span
                 className={`text-[10px] px-1.5 py-0.5 rounded font-semibold ${
@@ -202,7 +224,7 @@ export function EmbeddedLocalAiCard({
               </span>
             </div>
             <p className="text-[11px] text-zinc-500 dark:text-zinc-400 mt-0.5">
-              直接装进手机本机运行 + 养生/健身知识库增强 · 不连电脑、不需 API Key
+              支持 Qwen3-8B / 4B 原生离线直跑 · 与音枢、EchoDeck 零拷贝共用 Download/LocalAI
             </p>
           </div>
         </div>
@@ -222,6 +244,46 @@ export function EmbeddedLocalAiCard({
         )}
       </div>
 
+      {/* 三端共享模型目录授权条 */}
+      {nativeAndroid && (
+        <div
+          className={`flex items-center justify-between gap-2 px-3 py-2.5 rounded-xl border text-[11px] ${
+            sharedGranted
+              ? 'bg-emerald-500/8 border-emerald-500/25'
+              : 'bg-amber-500/8 border-amber-500/25'
+          }`}
+        >
+          <div className="flex items-start gap-2 min-w-0">
+            <FolderOpen
+              className={`w-4 h-4 shrink-0 mt-0.5 ${
+                sharedGranted ? 'text-emerald-600 dark:text-emerald-400' : 'text-amber-600 dark:text-amber-400'
+              }`}
+            />
+            <div className="min-w-0">
+              <div className="font-bold text-zinc-900 dark:text-zinc-100">
+                {sharedGranted
+                  ? '✓ 已连通三端共享目录（Download/LocalAI）'
+                  : '未开启三端共享目录权限（Download/LocalAI）'}
+              </div>
+              <div className="text-[10px] text-zinc-500 dark:text-zinc-400 mt-0.5 leading-snug">
+                {sharedGranted
+                  ? '在音枢、EchoDeck 或 LifeOS 任一 App 下载的模型，三端直接共用不占多份空间。'
+                  : '点右侧授予「所有文件访问」，只需下 1 份 Qwen3-8B / 4B，三个 App 全部直读。'}
+              </div>
+            </div>
+          </div>
+          {!sharedGranted && (
+            <button
+              type="button"
+              onClick={handleRequestSharedPerm}
+              className="shrink-0 px-2.5 py-1.5 rounded-lg text-[11px] font-bold bg-[#1a6e5e] text-white"
+            >
+              去开启
+            </button>
+          )}
+        </div>
+      )}
+
       {/* 环境状态条 */}
       <div className="flex items-start justify-between gap-2 px-3 py-2 rounded-xl bg-zinc-50 dark:bg-zinc-800/60 text-[11px]">
         <div className="flex items-start gap-1.5 text-zinc-600 dark:text-zinc-300 min-w-0">
@@ -231,7 +293,7 @@ export function EmbeddedLocalAiCard({
               ? status?.loaded
                 ? `已载入内存：${status.loadedFileName}`
                 : hasAnyDownloaded
-                  ? `本机已下载 ${status?.downloadedFiles.length} 个模型（待载入）`
+                  ? `已发现 ${status?.downloadedFiles.length} 个本地/共享模型（可直接启用）`
                   : '原生 ARM64 引擎已就绪 · 点下方免费下载模型即可离线用'
               : 'Android 原生引擎已打包进 APK（网页预览不支持，装到手机即可一键下载运行）'}
           </span>
@@ -249,10 +311,11 @@ export function EmbeddedLocalAiCard({
         )}
       </div>
 
-      {/* 3 款精选国内魔搭直连 GGUF 模型 */}
+      {/* 三端统一 4 款国内魔搭直连 GGUF 模型（支持 5GB 断点续传） */}
       <div className="space-y-2">
         {EMBEDDED_LOCAL_MODELS.map((spec) => {
-          const downloaded = isDownloaded(spec.fileName);
+          const hit = findDownloaded(spec.fileName);
+          const downloaded = Boolean(hit);
           const isThisDownloading = downloadingId === spec.id;
           const isThisLoading = loadingModelId === spec.id;
           const isCurrentActive = isEmbeddedActive && settings.aiModel === spec.fileName;
@@ -273,7 +336,7 @@ export function EmbeddedLocalAiCard({
                       {spec.name}
                     </span>
                     <span className="text-[10px] px-1.5 py-0.5 rounded bg-zinc-200/80 dark:bg-zinc-700 text-zinc-600 dark:text-zinc-300 num-tabular">
-                      {spec.badge}
+                      {hit?.shared ? '三端共享 ✓' : spec.badge}
                     </span>
                   </div>
                   <p className="text-[11px] text-zinc-500 dark:text-zinc-400 mt-0.5 leading-relaxed">
@@ -287,7 +350,7 @@ export function EmbeddedLocalAiCard({
                 <div className="space-y-1">
                   <div className="flex items-center justify-between text-[11px] text-emerald-600 dark:text-emerald-400 num-tabular">
                     <span>
-                      魔搭国内源下载中... {progress.percent}%
+                      魔搭国内源下载中（支持续传）... {progress.percent}%
                       {progress.totalBytes > 0
                         ? ` (${formatBytesMB(progress.downloadedBytes)} / ${formatBytesMB(progress.totalBytes)})`
                         : ''}
@@ -314,7 +377,7 @@ export function EmbeddedLocalAiCard({
                       className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-semibold bg-rose-500/12 text-rose-600 dark:text-rose-400"
                     >
                       <X className="w-3.5 h-3.5" />
-                      取消
+                      暂停
                     </button>
                   ) : downloaded ? (
                     <>
@@ -359,6 +422,45 @@ export function EmbeddedLocalAiCard({
                   )}
                 </div>
               </div>
+            </div>
+          );
+        })}
+
+        {/* 展示共享目录中用户自行放入的其他 GGUF 文件 */}
+        {extraFiles.map((ef) => {
+          const customSpec: EmbeddedModelSpec = {
+            id: ef.fileName,
+            name: ef.fileName,
+            badge: ef.shared ? '三端共享自定义' : '本地自定义',
+            fileName: ef.fileName,
+            sizeLabel: formatBytesMB(ef.sizeBytes),
+            ramHint: '自定义 GGUF 权重',
+            desc: '自动从手机共享/本地目录识别到的 GGUF 模型',
+            primaryUrl: '',
+            fallbackUrl: '',
+          };
+          const isCurrentActive = isEmbeddedActive && settings.aiModel === ef.fileName;
+          return (
+            <div
+              key={ef.fileName}
+              className="p-3 rounded-xl border bg-zinc-50/80 dark:bg-zinc-800/45 border-zinc-200/70 dark:border-zinc-800 flex items-center justify-between gap-2"
+            >
+              <div className="min-w-0">
+                <div className="text-xs font-bold text-zinc-900 dark:text-zinc-100 truncate">
+                  {ef.fileName}
+                </div>
+                <div className="text-[10px] text-zinc-500 dark:text-zinc-400">
+                  {formatBytesMB(ef.sizeBytes)} · {ef.shared ? '共享目录 Download/LocalAI' : '本地目录'}
+                </div>
+              </div>
+              <button
+                type="button"
+                disabled={loadingModelId === customSpec.id}
+                onClick={() => handleActivate(customSpec)}
+                className="shrink-0 inline-flex items-center gap-1 px-3 py-1.5 rounded-xl text-xs font-semibold bg-zinc-900 dark:bg-zinc-100 text-white dark:text-zinc-900"
+              >
+                {isCurrentActive ? '使用中 ✓' : '启用'}
+              </button>
             </div>
           );
         })}

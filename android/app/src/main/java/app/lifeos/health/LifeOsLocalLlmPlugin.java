@@ -1,5 +1,11 @@
 package app.lifeos.health;
 
+import android.content.Intent;
+import android.net.Uri;
+import android.os.Build;
+import android.os.Environment;
+import android.provider.Settings;
+
 import com.getcapacitor.JSArray;
 import com.getcapacitor.JSObject;
 import com.getcapacitor.Plugin;
@@ -13,18 +19,21 @@ import org.json.JSONObject;
 
 import java.io.BufferedInputStream;
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * LifeOS 内置端侧大模型原生插件（基于预编译 ARM64 llama.cpp JNI）：
- * - 直接在手机端侧运行量化 GGUF 模型（Qwen2.5 / Qwen3），无需外部电脑、Termux 或云端 API
- * - 支持魔搭社区 / HF-Mirror 国内高速流式下载、GGUF 文件头校验、进度广播与断点清理
+ * - 支持与音枢 AI 音乐、EchoDeck 零拷贝共享手机公共目录 Download/LocalAI 中的同一份 GGUF 模型
+ * - 支持 5GB 级大模型（Qwen3-8B / Qwen3-4B）HTTP Range 断点续传、GGUF 魔数头校验与主备源自动回退
  */
 @CapacitorPlugin(name = "LifeOsLocalLlm")
 public class LifeOsLocalLlmPlugin extends Plugin {
@@ -36,8 +45,23 @@ public class LifeOsLocalLlmPlugin extends Plugin {
 
     private volatile long loadedHandle = 0L;
     private volatile String loadedFileName = "";
+    private volatile String loadedFilePath = "";
 
-    private File getModelsDir() {
+    private boolean hasSharedStorageAccess() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            return Environment.isExternalStorageManager();
+        }
+        return true;
+    }
+
+    private File getSharedModelsDir() {
+        return new File(
+                Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
+                "LocalAI"
+        );
+    }
+
+    private File getPrivateModelsDir() {
         File dir = new File(getContext().getFilesDir(), "models");
         if (!dir.exists()) {
             //noinspection ResultOfMethodCallIgnored
@@ -46,26 +70,120 @@ public class LifeOsLocalLlmPlugin extends Plugin {
         return dir;
     }
 
+    private File getActiveWriteDir() {
+        if (hasSharedStorageAccess()) {
+            File shared = getSharedModelsDir();
+            if (shared.exists() || shared.mkdirs()) {
+                if (shared.canWrite()) {
+                    return shared;
+                }
+            }
+        }
+        return getPrivateModelsDir();
+    }
+
+    private File findModelFile(String fileName) {
+        if (hasSharedStorageAccess()) {
+            File shared = new File(getSharedModelsDir(), fileName);
+            if (shared.isFile() && shared.length() > 10L * 1024L * 1024L) {
+                return shared;
+            }
+        }
+        File priv = new File(getPrivateModelsDir(), fileName);
+        if (priv.isFile() && priv.length() > 10L * 1024L * 1024L) {
+            return priv;
+        }
+        return null;
+    }
+
     private String sanitizeFileName(String raw) {
         if (raw == null) return "";
         return raw.replaceAll("[^a-zA-Z0-9._-]", "");
     }
 
+    private boolean hasValidGgufHeader(File file) {
+        if (file == null || !file.exists() || file.length() < 4L) return false;
+        try (FileInputStream fis = new FileInputStream(file)) {
+            byte[] h = new byte[4];
+            return fis.read(h) == 4
+                    && h[0] == 'G' && h[1] == 'G' && h[2] == 'U' && h[3] == 'F';
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    @PluginMethod
+    public void requestSharedStoragePermission(PluginCall call) {
+        try {
+            boolean granted = hasSharedStorageAccess();
+            if (granted || Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+                JSObject ret = new JSObject();
+                ret.put("granted", true);
+                ret.put("openedSettings", false);
+                call.resolve(ret);
+                return;
+            }
+            Intent intent = new Intent(
+                    Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                    Uri.parse("package:" + getContext().getPackageName())
+            );
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            try {
+                getContext().startActivity(intent);
+            } catch (Exception fallbackEx) {
+                Intent fallback = new Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION);
+                fallback.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                getContext().startActivity(fallback);
+            }
+            JSObject ret = new JSObject();
+            ret.put("granted", false);
+            ret.put("openedSettings", true);
+            call.resolve(ret);
+        } catch (Exception e) {
+            call.reject("打开共享目录权限页面失败：" + e.getMessage(), e);
+        }
+    }
+
     @PluginMethod
     public void getStatus(PluginCall call) {
         try {
-            File dir = getModelsDir();
-            JSArray filesArr = new JSArray();
-            File[] files = dir.listFiles();
-            if (files != null) {
-                for (File f : files) {
-                    if (f.isFile() && f.getName().endsWith(".gguf")) {
-                        JSObject item = new JSObject();
-                        item.put("fileName", f.getName());
-                        item.put("sizeBytes", f.length());
-                        filesArr.put(item);
+            boolean sharedGranted = hasSharedStorageAccess();
+            File sharedDir = getSharedModelsDir();
+            File activeDir = getActiveWriteDir();
+
+            Map<String, JSObject> byName = new LinkedHashMap<>();
+            if (sharedGranted && sharedDir.exists()) {
+                File[] sFiles = sharedDir.listFiles();
+                if (sFiles != null) {
+                    for (File f : sFiles) {
+                        if (f.isFile() && f.getName().toLowerCase().endsWith(".gguf") && f.length() > 10L * 1024L * 1024L) {
+                            JSObject item = new JSObject();
+                            item.put("fileName", f.getName());
+                            item.put("sizeBytes", f.length());
+                            item.put("shared", true);
+                            byName.put(f.getName(), item);
+                        }
                     }
                 }
+            }
+            File[] pFiles = getPrivateModelsDir().listFiles();
+            if (pFiles != null) {
+                for (File f : pFiles) {
+                    if (f.isFile() && f.getName().toLowerCase().endsWith(".gguf") && f.length() > 10L * 1024L * 1024L) {
+                        if (!byName.containsKey(f.getName())) {
+                            JSObject item = new JSObject();
+                            item.put("fileName", f.getName());
+                            item.put("sizeBytes", f.length());
+                            item.put("shared", false);
+                            byName.put(f.getName(), item);
+                        }
+                    }
+                }
+            }
+
+            JSArray filesArr = new JSArray();
+            for (JSObject item : byName.values()) {
+                filesArr.put(item);
             }
 
             String sysInfo = "";
@@ -82,8 +200,10 @@ public class LifeOsLocalLlmPlugin extends Plugin {
             ret.put("loaded", loadedHandle != 0L);
             ret.put("loadedFileName", loadedFileName);
             ret.put("downloading", isDownloading.get());
+            ret.put("sharedStorageGranted", sharedGranted);
+            ret.put("sharedDirPath", sharedDir.getAbsolutePath());
             ret.put("systemInfo", sysInfo);
-            ret.put("modelsDir", dir.getAbsolutePath());
+            ret.put("modelsDir", activeDir.getAbsolutePath());
             ret.put("downloadedFiles", filesArr);
             call.resolve(ret);
         } catch (Exception e) {
@@ -97,25 +217,27 @@ public class LifeOsLocalLlmPlugin extends Plugin {
         final String fallbackUrl = call.getString("fallbackUrl", "");
         final String fileName = sanitizeFileName(call.getString("fileName", ""));
 
-        if (primaryUrl == null || primaryUrl.isEmpty() || fileName.isEmpty() || !fileName.endsWith(".gguf")) {
+        if (primaryUrl == null || primaryUrl.isEmpty() || fileName.isEmpty() || !fileName.toLowerCase().endsWith(".gguf")) {
             call.reject("缺少合法的模型下载地址或文件名");
             return;
         }
         if (!isDownloading.compareAndSet(false, true)) {
-            call.reject("已有模型正在下载中，请等待完成或先取消");
+            call.reject("已有模型正在下载中，请等待完成或先暂停");
             return;
         }
 
         cancelDownloadFlag.set(false);
 
         downloadExecutor.execute(() -> {
-            File finalFile = new File(getModelsDir(), fileName);
-            File partFile = new File(getModelsDir(), fileName + ".part");
+            File targetDir = getActiveWriteDir();
+            File finalFile = new File(targetDir, fileName);
+            File partFile = new File(targetDir, fileName + ".part");
             try {
-                if (finalFile.exists() && finalFile.length() > 50L * 1024L * 1024L) {
+                File existing = findModelFile(fileName);
+                if (existing != null && existing.length() > 50L * 1024L * 1024L) {
                     JSObject ret = new JSObject();
                     ret.put("fileName", fileName);
-                    ret.put("sizeBytes", finalFile.length());
+                    ret.put("sizeBytes", existing.length());
                     ret.put("alreadyExisted", true);
                     call.resolve(ret);
                     return;
@@ -129,7 +251,7 @@ public class LifeOsLocalLlmPlugin extends Plugin {
                 boolean success = false;
                 for (String targetUrl : urls) {
                     if (cancelDownloadFlag.get()) {
-                        throw new InterruptedException("用户已取消下载");
+                        throw new InterruptedException("用户已暂停下载");
                     }
                     try {
                         streamDownloadWithRedirects(targetUrl, partFile, fileName);
@@ -139,10 +261,6 @@ public class LifeOsLocalLlmPlugin extends Plugin {
                         throw ie;
                     } catch (Exception ex) {
                         lastErr = ex;
-                        if (partFile.exists()) {
-                            //noinspection ResultOfMethodCallIgnored
-                            partFile.delete();
-                        }
                     }
                 }
 
@@ -150,12 +268,18 @@ public class LifeOsLocalLlmPlugin extends Plugin {
                     throw (lastErr != null ? lastErr : new RuntimeException("所有镜像源均下载失败"));
                 }
 
+                if (!hasValidGgufHeader(partFile) || partFile.length() < 10L * 1024L * 1024L) {
+                    //noinspection ResultOfMethodCallIgnored
+                    partFile.delete();
+                    throw new RuntimeException("模型文件校验失败，请重试");
+                }
+
                 if (finalFile.exists()) {
                     //noinspection ResultOfMethodCallIgnored
                     finalFile.delete();
                 }
                 if (!partFile.renameTo(finalFile)) {
-                    throw new RuntimeException("模型文件写入重命名失败");
+                    throw new RuntimeException("模型文件写入重命名失败，请检查存储空间");
                 }
 
                 JSObject ret = new JSObject();
@@ -164,16 +288,8 @@ public class LifeOsLocalLlmPlugin extends Plugin {
                 ret.put("alreadyExisted", false);
                 call.resolve(ret);
             } catch (InterruptedException ie) {
-                if (partFile.exists()) {
-                    //noinspection ResultOfMethodCallIgnored
-                    partFile.delete();
-                }
-                call.reject("已取消模型下载");
+                call.reject("已暂停下载（已保留断点进度，再次点击可续传）");
             } catch (Exception e) {
-                if (partFile.exists()) {
-                    //noinspection ResultOfMethodCallIgnored
-                    partFile.delete();
-                }
                 call.reject("模型下载失败：" + e.getMessage(), e);
             } finally {
                 isDownloading.set(false);
@@ -182,6 +298,16 @@ public class LifeOsLocalLlmPlugin extends Plugin {
     }
 
     private void streamDownloadWithRedirects(String initialUrl, File destFile, String fileName) throws Exception {
+        long resumeOffset = 0L;
+        if (destFile.exists()) {
+            if (hasValidGgufHeader(destFile)) {
+                resumeOffset = destFile.length();
+            } else {
+                //noinspection ResultOfMethodCallIgnored
+                destFile.delete();
+            }
+        }
+
         String currentUrl = initialUrl;
         HttpURLConnection conn = null;
         int redirects = 0;
@@ -191,9 +317,12 @@ public class LifeOsLocalLlmPlugin extends Plugin {
                 URL u = new URL(currentUrl);
                 conn = (HttpURLConnection) u.openConnection();
                 conn.setInstanceFollowRedirects(false);
-                conn.setConnectTimeout(15000);
-                conn.setReadTimeout(30000);
-                conn.setRequestProperty("User-Agent", "LifeOS-Android/1.0");
+                conn.setConnectTimeout(18000);
+                conn.setReadTimeout(60000);
+                conn.setRequestProperty("User-Agent", "LifeOS-Android/1.1");
+                if (resumeOffset > 0L) {
+                    conn.setRequestProperty("Range", "bytes=" + resumeOffset + "-");
+                }
                 int code = conn.getResponseCode();
                 if (code == 301 || code == 302 || code == 303 || code == 307 || code == 308) {
                     String loc = conn.getHeaderField("Location");
@@ -206,6 +335,9 @@ public class LifeOsLocalLlmPlugin extends Plugin {
                     redirects++;
                     continue;
                 }
+                if (code == 416 && hasValidGgufHeader(destFile)) {
+                    return;
+                }
                 if (code < 200 || code >= 300) {
                     throw new RuntimeException("HTTP " + code + " 下载被拒绝");
                 }
@@ -216,22 +348,29 @@ public class LifeOsLocalLlmPlugin extends Plugin {
                 throw new RuntimeException("无法建立下载连接");
             }
 
-            long totalBytes = conn.getContentLengthLong();
-            long downloaded = 0L;
+            int finalCode = conn.getResponseCode();
+            boolean appendMode = (finalCode == 206 && resumeOffset > 0L);
+            if (!appendMode) {
+                resumeOffset = 0L;
+            }
+
+            long contentLen = conn.getContentLengthLong();
+            long totalBytes = (appendMode && contentLen > 0L) ? (resumeOffset + contentLen) : contentLen;
+            long downloaded = resumeOffset;
+            long sessionStartDownloaded = resumeOffset;
             long startMs = System.currentTimeMillis();
             long lastEmitMs = 0L;
-            boolean headerChecked = false;
+            boolean headerChecked = appendMode;
 
-            try (InputStream in = new BufferedInputStream(conn.getInputStream(), 65536);
-                 FileOutputStream out = new FileOutputStream(destFile)) {
-                byte[] buf = new byte[65536];
+            try (InputStream in = new BufferedInputStream(conn.getInputStream(), 131072);
+                 FileOutputStream out = new FileOutputStream(destFile, appendMode)) {
+                byte[] buf = new byte[131072];
                 int n;
                 while ((n = in.read(buf)) != -1) {
                     if (cancelDownloadFlag.get()) {
-                        throw new InterruptedException("用户已取消下载");
+                        throw new InterruptedException("用户已暂停下载");
                     }
                     if (!headerChecked && n >= 4) {
-                        // 校验文件头必须为标准 GGUF 魔数，防止下载到错误 HTML 页
                         if (buf[0] != 'G' || buf[1] != 'G' || buf[2] != 'U' || buf[3] != 'F') {
                             throw new RuntimeException("远端返回的不是有效 GGUF 模型文件");
                         }
@@ -241,10 +380,10 @@ public class LifeOsLocalLlmPlugin extends Plugin {
                     downloaded += n;
 
                     long now = System.currentTimeMillis();
-                    if (now - lastEmitMs >= 250 || (totalBytes > 0 && downloaded >= totalBytes)) {
+                    if (now - lastEmitMs >= 300 || (totalBytes > 0 && downloaded >= totalBytes)) {
                         lastEmitMs = now;
-                        double elapsedSec = Math.max(0.2, (now - startMs) / 1000.0);
-                        double speedMbps = (downloaded / 1024.0 / 1024.0) / elapsedSec;
+                        double elapsedSec = Math.max(0.25, (now - startMs) / 1000.0);
+                        double speedMbps = ((downloaded - sessionStartDownloaded) / 1024.0 / 1024.0) / elapsedSec;
                         int pct = totalBytes > 0 ? (int) Math.min(100, (downloaded * 100L) / totalBytes) : 0;
 
                         JSObject ev = new JSObject();
@@ -257,10 +396,6 @@ public class LifeOsLocalLlmPlugin extends Plugin {
                     }
                 }
                 out.flush();
-            }
-
-            if (!headerChecked || downloaded < 10L * 1024L * 1024L) {
-                throw new RuntimeException("模型文件不完整，请重试");
             }
         } finally {
             if (conn != null) {
@@ -290,9 +425,22 @@ public class LifeOsLocalLlmPlugin extends Plugin {
                     LlamaJNI.INSTANCE.nativeReleaseModel(loadedHandle);
                     loadedHandle = 0L;
                     loadedFileName = "";
+                    loadedFilePath = "";
                 }
-                File f = new File(getModelsDir(), fileName);
-                boolean deleted = !f.exists() || f.delete();
+                boolean deleted = true;
+                if (hasSharedStorageAccess()) {
+                    File sf = new File(getSharedModelsDir(), fileName);
+                    if (sf.exists()) deleted = deleted && sf.delete();
+                    File sp = new File(getSharedModelsDir(), fileName + ".part");
+                    if (sp.exists()) //noinspection ResultOfMethodCallIgnored
+                        sp.delete();
+                }
+                File pf = new File(getPrivateModelsDir(), fileName);
+                if (pf.exists()) deleted = deleted && pf.delete();
+                File pp = new File(getPrivateModelsDir(), fileName + ".part");
+                if (pp.exists()) //noinspection ResultOfMethodCallIgnored
+                    pp.delete();
+
                 JSObject ret = new JSObject();
                 ret.put("deleted", deleted);
                 call.resolve(ret);
@@ -316,7 +464,13 @@ public class LifeOsLocalLlmPlugin extends Plugin {
 
         inferenceExecutor.execute(() -> {
             try {
-                if (loadedHandle != 0L && fileName.equals(loadedFileName)) {
+                File modelFile = findModelFile(fileName);
+                if (modelFile == null || !modelFile.exists()) {
+                    call.reject("模型尚未下载（或未开启共享目录权限）：" + fileName);
+                    return;
+                }
+
+                if (loadedHandle != 0L && modelFile.getAbsolutePath().equals(loadedFilePath)) {
                     JSObject ret = new JSObject();
                     ret.put("loaded", true);
                     ret.put("fileName", loadedFileName);
@@ -325,36 +479,33 @@ public class LifeOsLocalLlmPlugin extends Plugin {
                     return;
                 }
 
-                File modelFile = new File(getModelsDir(), fileName);
-                if (!modelFile.exists()) {
-                    call.reject("模型尚未下载：" + fileName);
-                    return;
-                }
-
                 if (loadedHandle != 0L) {
                     LlamaJNI.INSTANCE.nativeReleaseModel(loadedHandle);
                     loadedHandle = 0L;
                     loadedFileName = "";
+                    loadedFilePath = "";
                 }
 
                 long startMs = System.currentTimeMillis();
                 long handle = LlamaJNI.INSTANCE.nativeLoadModel(
                         modelFile.getAbsolutePath(),
-                        contextSize,
+                        Math.max(1024, Math.min(4096, contextSize)),
                         threads,
                         0
                 );
                 if (handle == 0L) {
-                    call.reject("模型加载失败（可能内存不足，可尝试改用更轻量的 0.6B 模型）");
+                    call.reject("模型加载失败（可能内存不足，可先清后台或改用 4B/1.7B 模型）");
                     return;
                 }
 
                 loadedHandle = handle;
                 loadedFileName = fileName;
+                loadedFilePath = modelFile.getAbsolutePath();
 
                 JSObject ret = new JSObject();
                 ret.put("loaded", true);
                 ret.put("fileName", fileName);
+                ret.put("shared", loadedFilePath.startsWith(getSharedModelsDir().getAbsolutePath()));
                 ret.put("loadTimeMs", System.currentTimeMillis() - startMs);
                 ret.put("threads", threads);
                 call.resolve(ret);
@@ -371,6 +522,7 @@ public class LifeOsLocalLlmPlugin extends Plugin {
                 LlamaJNI.INSTANCE.nativeReleaseModel(loadedHandle);
                 loadedHandle = 0L;
                 loadedFileName = "";
+                loadedFilePath = "";
             }
             JSObject ret = new JSObject();
             ret.put("unloaded", true);
@@ -382,7 +534,7 @@ public class LifeOsLocalLlmPlugin extends Plugin {
     public void complete(PluginCall call) {
         final String prompt = call.getString("prompt", "");
         final String systemPrompt = call.getString("systemPrompt", "");
-        final int maxTokens = call.getInt("maxTokens", 380);
+        final int maxTokens = call.getInt("maxTokens", 420);
         final float temperature = call.getFloat("temperature", 0.45f);
 
         if (prompt == null || prompt.trim().isEmpty()) {
@@ -392,7 +544,7 @@ public class LifeOsLocalLlmPlugin extends Plugin {
 
         inferenceExecutor.execute(() -> {
             if (loadedHandle == 0L) {
-                call.reject("端侧模型尚未加载，请先在设置页下载并启用内置 AI 模型");
+                call.reject("端侧模型尚未加载，请先在设置页启用内置 AI 模型");
                 return;
             }
             try {
@@ -400,7 +552,7 @@ public class LifeOsLocalLlmPlugin extends Plugin {
                         loadedHandle,
                         prompt,
                         systemPrompt != null ? systemPrompt : "",
-                        Math.max(32, Math.min(768, maxTokens)),
+                        Math.max(32, Math.min(1024, maxTokens)),
                         temperature,
                         0.9f,
                         40,
@@ -448,6 +600,7 @@ public class LifeOsLocalLlmPlugin extends Plugin {
             }
             loadedHandle = 0L;
             loadedFileName = "";
+            loadedFilePath = "";
         }
         inferenceExecutor.shutdownNow();
         downloadExecutor.shutdownNow();
