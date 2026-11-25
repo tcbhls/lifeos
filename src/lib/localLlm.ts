@@ -268,11 +268,15 @@ export async function runEmbeddedLocalCompletion(params: {
 
   const start = performance.now();
   if (!status.loaded || status.loadedFileName !== targetFile) {
-    await NativeLocalLlm.loadModel({ fileName: targetFile, contextSize: 2048 });
+    await NativeLocalLlm.loadModel({ fileName: targetFile, contextSize: 3072 });
   }
 
-  // Qwen3 关闭冗长思考标签，确保端侧生成干脆迅速
+  // Qwen3 在系统提示与用户提示双端关闭冗长思考标签，同时告知当前运行的真实本地模型名
   const isQwen3 = targetFile.toLowerCase().includes('qwen3');
+  const rawSys = (params.systemPrompt || '').slice(0, 900);
+  const sysWithModel = rawSys
+    ? `${rawSys}\n（当前本机离线运行模型：${targetFile}）${isQwen3 ? '\n/no_think' : ''}`
+    : `你是 LifeOS 本地离线健身养生管家（当前运行模型：${targetFile}）。${isQwen3 ? '\n/no_think' : ''}`;
   const finalPrompt =
     isQwen3 && !params.userPrompt.includes('/no_think')
       ? `${params.userPrompt}\n/no_think`
@@ -280,8 +284,8 @@ export async function runEmbeddedLocalCompletion(params: {
 
   const res = await NativeLocalLlm.complete({
     prompt: finalPrompt,
-    systemPrompt: params.systemPrompt || '',
-    maxTokens: Math.min(520, params.maxTokens ?? 400),
+    systemPrompt: sysWithModel,
+    maxTokens: Math.min(360, params.maxTokens ?? 320),
     temperature: params.temperature ?? 0.45,
   });
 
